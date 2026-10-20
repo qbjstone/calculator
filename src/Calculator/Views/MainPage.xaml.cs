@@ -1,10 +1,10 @@
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
+using System.Text.Json;
 using System.Threading.Tasks;
 
 using Windows.ApplicationModel.UserActivities;
-using Windows.Data.Json;
 using Windows.Foundation;
 using Windows.Graphics.Display;
 using Windows.Storage;
@@ -18,6 +18,7 @@ using Microsoft.UI.Xaml.Controls;
 
 using CalculatorApp.Common;
 using CalculatorApp.Converters;
+using CalculatorApp.JsonUtils;
 using CalculatorApp.ViewModel;
 using CalculatorApp.ViewModel.Common;
 using CalculatorApp.ViewModel.Common.Automation;
@@ -37,18 +38,18 @@ namespace CalculatorApp
             set => SetValue(NavViewCategoriesSourceProperty, value);
         }
 
-        public ApplicationViewModel Model { get; }
+        public ApplicationViewModel ViewModel { get; }
 
         public MainPage()
         {
-            Model = new ApplicationViewModel();
+            ViewModel = new ApplicationViewModel();
             InitializeNavViewCategoriesSource();
             InitializeComponent();
 
             KeyboardShortcutManager.Initialize();
 
             Application.Current.Suspending += App_Suspending;
-            Model.PropertyChanged += OnAppPropertyChanged;
+            ViewModel.PropertyChanged += OnAppPropertyChanged;
             m_accessibilitySettings = new AccessibilitySettings();
 
             if (Utilities.GetIntegratedDisplaySize(out var sizeInInches))
@@ -61,24 +62,38 @@ namespace CalculatorApp
 
             UserActivityRequestManager.GetForCurrentView().UserActivityRequested += async (_, args) =>
             {
-                var deferral = args.GetDeferral();
-                if (deferral == null)
+                using (var deferral = args.GetDeferral())
                 {
-                    // Windows Bug in ni_moment won't return the deferral propoerly, see https://microsoft.visualstudio.com/DefaultCollection/OS/_workitems/edit/47775705/
-                    return;
+                    if (deferral == null)
+                    {
+                        // FIXME: https://microsoft.visualstudio.com/DefaultCollection/OS/_workitems/edit/47775705/
+                        TraceLogger.GetInstance().LogRecallError("55e29ba5-6097-40ec-8960-458750be3039");
+                        return;
+                    }
+                    var channel = UserActivityChannel.GetDefault();
+                    var activity = await channel.GetOrCreateUserActivityAsync($"{Guid.NewGuid()}");
+                    string embeddedData;
+                    try
+                    {
+                        var json = JsonSerializer.Serialize(new ApplicationSnapshotAlias(ViewModel.Snapshot));
+                        embeddedData = Convert.ToBase64String(DeflateUtils.Compress(json));
+                    }
+                    catch (Exception ex)
+                    {
+                        TraceLogger.GetInstance().LogRecallError($"Error occurs during the serialization of Snapshot. Exception: {ex}");
+                        deferral.Complete();
+                        return;
+                    }
+                    activity.ActivationUri = new Uri($"ms-calculator:snapshot/{embeddedData}");
+                    activity.IsRoamable = false;
+                    var resProvider = AppResourceProvider.GetInstance();
+                    activity.VisualElements.DisplayText =
+                        $"{resProvider.GetResourceString("AppName")} - {resProvider.GetResourceString(NavCategoryStates.GetNameResourceKey(ViewModel.Mode))}";
+                    await activity.SaveAsync();
+                    args.Request.SetUserActivity(activity);
+                    deferral.Complete();
+                    TraceLogger.GetInstance().LogRecallSnapshot(ViewModel.Mode);
                 }
-                var channel = UserActivityChannel.GetDefault();
-                var activity = await channel.GetOrCreateUserActivityAsync($"{Guid.NewGuid()}");
-                activity.ActivationUri = new Uri($"ms-calculator:snapshots/{activity.ActivityId}");
-                activity.ContentInfo = UserActivityContentInfo.FromJson(Model.SaveApplicationSnapshot().Stringify());
-                activity.IsRoamable = false;
-                var resProvider = AppResourceProvider.GetInstance();
-                activity.VisualElements.DisplayText =
-                    $"{resProvider.GetResourceString("AppName")} - {resProvider.GetResourceString(NavCategoryStates.GetNameResourceKey(Model.Mode))}";
-                await activity.SaveAsync();
-                args.Request.SetUserActivity(activity);
-                deferral.Complete();
-                TraceLogger.GetInstance().LogRecallSnapshot(Model.Mode);
             };
         }
 
@@ -115,7 +130,7 @@ namespace CalculatorApp
 
         public void SetHeaderAutomationName()
         {
-            ViewMode mode = Model.Mode;
+            ViewMode mode = ViewModel.Mode;
             var resProvider = AppResourceProvider.GetInstance();
 
             string name;
@@ -134,7 +149,7 @@ namespace CalculatorApp
                 {
                     full = resProvider.GetResourceString("HeaderAutomationName_Converter");
                 }
-                name = LocalizationStringUtil.GetLocalizedString(full, Model.CategoryName);
+                name = LocalizationStringUtil.GetLocalizedString(full, ViewModel.CategoryName);
             }
 
             AutomationProperties.SetName(Header, name);
@@ -144,14 +159,14 @@ namespace CalculatorApp
         {
             var initialMode = ViewMode.Standard;
             var localSettings = ApplicationData.Current.LocalSettings;
-            if (localSettings.Values.ContainsKey(ApplicationViewModel.ModePropertyName))
+            if (localSettings.Values.ContainsKey(nameof(ApplicationViewModel.Mode)))
             {
-                initialMode = NavCategoryStates.Deserialize(localSettings.Values[ApplicationViewModel.ModePropertyName]);
+                initialMode = NavCategoryStates.Deserialize(localSettings.Values[nameof(ApplicationViewModel.Mode)]);
             }
 
             if (e.Parameter == null)
             {
-                Model.Initialize(initialMode);
+                ViewModel.Initialize(initialMode);
                 return;
             }
 
@@ -161,27 +176,35 @@ namespace CalculatorApp
                 {
                     initialMode = (ViewMode)Convert.ToInt32(legacyArgs);
                 }
-                Model.Initialize(initialMode);
+                ViewModel.Initialize(initialMode);
             }
             else if (e.Parameter is SnapshotLaunchArguments snapshotArgs)
             {
-                _ = Window.Current.Dispatcher.RunAsync(CoreDispatcherPriority.Normal, async () =>
+                ViewModel.Initialize(initialMode);
+                bool restored = false;
+                if (!snapshotArgs.HasError)
                 {
-                    var channel = UserActivityChannel.GetDefault();
-                    var activity = await channel.GetOrCreateUserActivityAsync(snapshotArgs.ActivityId);
+                    try
+                    {
+                        ViewModel.RestoreFromSnapshot(snapshotArgs.Snapshot);
+                        restored = true;
+                        TraceLogger.GetInstance().LogRecallRestore((ViewMode)snapshotArgs.Snapshot.Mode);
+                    }
+                    catch (Exception ex)
+                    {
+                        TraceLogger.GetInstance().LogRecallError($"OnNavigatedTo:Restore failed. {ex.Message}");
+                    }
+                }
 
-                    if (TryRestoreFromActivity(snapshotArgs, activity, out var errorMessage))
+                if (!restored)
+                {
+                    _ = Window.Current.Dispatcher.RunAsync(CoreDispatcherPriority.Normal,
+                        async () => await ShowSnapshotLaunchErrorAsync());
+                    if (snapshotArgs.HasError)
                     {
-                        TraceLogger.GetInstance().LogRecallRestore(Model.Mode);
-                        SelectNavigationItemByModel();
+                        TraceLogger.GetInstance().LogRecallError("OnNavigatedTo:Found errors.");
                     }
-                    else
-                    {
-                        TraceLogger.GetInstance().LogRecallError(Model.Mode, errorMessage);
-                        await ShowSnapshotLaunchErrorAsync();
-                    }
-                });
-                Model.Initialize(initialMode);
+                }
             }
             else
             {
@@ -189,47 +212,9 @@ namespace CalculatorApp
             }
         }
 
-        private bool TryRestoreFromActivity(SnapshotLaunchArguments snapshotArgs, UserActivity activity, out string errorMessage)
-        {
-            if (!snapshotArgs.VerifyIncomingActivity(activity))
-            {
-                errorMessage = "IncomingActivityFailed";
-                return false;
-            }
-
-            // Work around for bug https://microsoft.visualstudio.com/DefaultCollection/OS/_workitems/edit/48931227
-            // where ContentInfo can't be directly accessed.
-            if (!JsonObject.TryParse(activity.ToJson(), out var activityJson))
-            {
-                errorMessage = "ParseJsonError";
-                return false;
-            }
-
-            if (!activityJson.ContainsKey("contentInfo"))
-            {
-                errorMessage = "ContentInfoNotExist";
-                return false;
-            }
-
-            if (!Model.TryRestoreFromSnapshot(activityJson.GetNamedObject("contentInfo")))
-            {
-                errorMessage = "RestoreFromSnapshotFailed";
-                return false;
-            }
-
-            errorMessage = string.Empty;
-            return true;
-        }
-
         private void InitializeNavViewCategoriesSource()
         {
-            NavViewCategoriesSource = ExpandNavViewCategoryGroups(Model.Categories);
-            Model.Categories.VectorChanged += (sender, args) =>
-            {
-                NavViewCategoriesSource.Clear();
-                NavViewCategoriesSource = ExpandNavViewCategoryGroups(Model.Categories);
-            };
-
+            NavViewCategoriesSource = ExpandNavViewCategoryGroups(ViewModel.Categories);
             _ = Window.Current.Dispatcher.RunAsync(CoreDispatcherPriority.Low, () =>
             {
                 var graphCategory = (NavCategory)NavViewCategoriesSource.Find(x =>
@@ -280,10 +265,10 @@ namespace CalculatorApp
         private void OnAppPropertyChanged(object sender, PropertyChangedEventArgs e)
         {
             string propertyName = e.PropertyName;
-            if (propertyName == ApplicationViewModel.ModePropertyName)
+            if (propertyName == nameof(ApplicationViewModel.Mode))
             {
-                ViewMode newValue = Model.Mode;
-                ViewMode previousMode = Model.PreviousMode;
+                ViewMode newValue = ViewModel.Mode;
+                ViewMode previousMode = ViewModel.PreviousMode;
 
                 KeyboardShortcutManager.DisableShortcuts(false);
 
@@ -291,23 +276,23 @@ namespace CalculatorApp
                 {
                     case ViewMode.Standard:
                         EnsureCalculator();
-                        Model.CalculatorViewModel.HistoryVM.AreHistoryShortcutsEnabled = true;
+                        ViewModel.CalculatorViewModel.HistoryVM.AreHistoryShortcutsEnabled = true;
                         m_calculator.AnimateCalculator(NavCategory.IsConverterViewMode(previousMode));
-                        Model.CalculatorViewModel.HistoryVM.ReloadHistory(newValue);
+                        ViewModel.CalculatorViewModel.HistoryVM.ReloadHistory(newValue);
                         break;
                     case ViewMode.Scientific:
                         EnsureCalculator();
-                        Model.CalculatorViewModel.HistoryVM.AreHistoryShortcutsEnabled = true;
-                        if (Model.PreviousMode != ViewMode.Scientific)
+                        ViewModel.CalculatorViewModel.HistoryVM.AreHistoryShortcutsEnabled = true;
+                        if (ViewModel.PreviousMode != ViewMode.Scientific)
                         {
                             m_calculator.AnimateCalculator(NavCategory.IsConverterViewMode(previousMode));
                         }
-                        Model.CalculatorViewModel.HistoryVM.ReloadHistory(newValue);
+                        ViewModel.CalculatorViewModel.HistoryVM.ReloadHistory(newValue);
                         break;
                     case ViewMode.Programmer:
-                        Model.CalculatorViewModel.HistoryVM.AreHistoryShortcutsEnabled = false;
+                        ViewModel.CalculatorViewModel.HistoryVM.AreHistoryShortcutsEnabled = false;
                         EnsureCalculator();
-                        if (Model.PreviousMode != ViewMode.Programmer)
+                        if (ViewModel.PreviousMode != ViewMode.Programmer)
                         {
                             m_calculator.AnimateCalculator(NavCategory.IsConverterViewMode(previousMode));
                         }
@@ -319,17 +304,17 @@ namespace CalculatorApp
                     default:
                         if (NavCategory.IsDateCalculatorViewMode(newValue))
                         {
-                            if (Model.CalculatorViewModel != null)
+                            if (ViewModel.CalculatorViewModel != null)
                             {
-                                Model.CalculatorViewModel.HistoryVM.AreHistoryShortcutsEnabled = false;
+                                ViewModel.CalculatorViewModel.HistoryVM.AreHistoryShortcutsEnabled = false;
                             }
                             EnsureDateCalculator();
                         }
                         else if (NavCategory.IsConverterViewMode(newValue))
                         {
-                            if (Model.CalculatorViewModel != null)
+                            if (ViewModel.CalculatorViewModel != null)
                             {
-                                Model.CalculatorViewModel.HistoryVM.AreHistoryShortcutsEnabled = false;
+                                ViewModel.CalculatorViewModel.HistoryVM.AreHistoryShortcutsEnabled = false;
                             }
 
                             EnsureConverter();
@@ -346,7 +331,7 @@ namespace CalculatorApp
                 UpdateViewState();
                 SetDefaultFocus();
             }
-            else if (propertyName == ApplicationViewModel.CategoryNamePropertyName)
+            else if (propertyName == nameof(ApplicationViewModel.CategoryName))
             {
                 SetHeaderAutomationName();
                 AnnounceCategoryName();
@@ -357,7 +342,7 @@ namespace CalculatorApp
         {
             var menuItems = (List<object>)NavView.MenuItemsSource;
             var itemCount = menuItems.Count;
-            var flatIndex = NavCategoryStates.GetFlatIndex(Model.Mode);
+            var flatIndex = NavCategoryStates.GetFlatIndex(ViewModel.Mode);
 
             if (flatIndex >= 0 && flatIndex < itemCount)
             {
@@ -396,7 +381,7 @@ namespace CalculatorApp
                 return;
             }
 
-            if (Model.Mode != ViewMode.Graphing)
+            if (ViewModel.Mode != ViewMode.Graphing)
             {
                 KeyboardShortcutManager.HonorShortcuts(true);
             }
@@ -451,7 +436,7 @@ namespace CalculatorApp
 
             if (e.SelectedItemContainer is NavigationViewItem item)
             {
-                Model.Mode = (ViewMode)item.Tag;
+                ViewModel.Mode = (ViewMode)item.Tag;
             }
         }
 
@@ -462,13 +447,13 @@ namespace CalculatorApp
 
         private void AlwaysOnTopButtonClick(object sender, RoutedEventArgs e)
         {
-            Model.ToggleAlwaysOnTop(0, 0);
+            ViewModel.ToggleAlwaysOnTop(0, 0);
         }
 
         private void TitleBarAlwaysOnTopButtonClick(object sender, RoutedEventArgs e)
         {
             var bounds = Window.Current.Bounds;
-            Model.ToggleAlwaysOnTop((float)bounds.Width, (float)bounds.Height);
+            ViewModel.ToggleAlwaysOnTop(bounds.Width, bounds.Height);
         }
 
         private void ShowHideControls(ViewMode mode)
@@ -506,10 +491,13 @@ namespace CalculatorApp
         private void UpdateViewState()
         {
             // All layout related view states are now handled only inside individual controls (standard, scientific, programmer, date, converter)
-            if (NavCategory.IsConverterViewMode(Model.Mode))
+            if (NavCategory.IsConverterViewMode(ViewModel.Mode))
             {
-                int modeIndex = NavCategoryStates.GetIndexInGroup(Model.Mode, CategoryGroupType.Converter);
-                Model.ConverterViewModel.CurrentCategory = Model.ConverterViewModel.Categories[modeIndex];
+                int modeIndex = NavCategoryStates.GetIndexInGroup(ViewModel.Mode, CategoryGroupType.Converter);
+                if (ViewModel.ConverterViewModel != null && modeIndex >= 0 && modeIndex < (ViewModel.ConverterViewModel.Categories?.Count ?? 0))
+                {
+                    ViewModel.ConverterViewModel.CurrentCategory = ViewModel.ConverterViewModel.Categories[modeIndex];
+                }
             }
         }
 
@@ -523,7 +511,7 @@ namespace CalculatorApp
 
         private void OnHighContrastChanged(AccessibilitySettings sender, object args)
         {
-            if (Model.IsAlwaysOnTop && ActualHeight < 394)
+            if (ViewModel.IsAlwaysOnTop && ActualHeight < 394)
             {
                 // Sets to default always-on-top size to force re-layout
                 ApplicationView.GetForCurrentView().TryResizeView(new Size(320, 394));
@@ -536,7 +524,7 @@ namespace CalculatorApp
             {
                 // We have just launched into our default mode (standard calc) so ensure calc is loaded
                 EnsureCalculator();
-                Model.CalculatorViewModel.IsStandard = true;
+                ViewModel.CalculatorViewModel.IsStandard = true;
             }
 
             Window.Current.SizeChanged += WindowSizeChanged;
@@ -560,11 +548,11 @@ namespace CalculatorApp
 
         private void App_Suspending(object sender, Windows.ApplicationModel.SuspendingEventArgs e)
         {
-            if (Model.IsAlwaysOnTop)
+            if (ViewModel.IsAlwaysOnTop)
             {
                 ApplicationDataContainer localSettings = ApplicationData.Current.LocalSettings;
-                localSettings.Values[ApplicationViewModel.WidthLocalSettings] = ActualWidth;
-                localSettings.Values[ApplicationViewModel.HeightLocalSettings] = ActualHeight;
+                localSettings.Values[ApplicationViewModel.WidthLocalSettingsKey] = ActualWidth;
+                localSettings.Values[ApplicationViewModel.HeightLocalSettingsKey] = ActualHeight;
             }
         }
 
@@ -572,12 +560,20 @@ namespace CalculatorApp
         {
             if (m_calculator == null)
             {
-                // delay load calculator.
-                m_calculator = new Calculator
+                var calcVM = ViewModel.CalculatorViewModel;
+
+                // In C#, CalculatorViewModel is lazily created in OnModeChanged.
+                // If EnsureCalculator is called before mode is set, force creation.
+                if (calcVM == null)
                 {
-                    Name = "Calculator",
-                    DataContext = Model.CalculatorViewModel
-                };
+                    ViewModel.Mode = ViewMode.Standard;
+                    calcVM = ViewModel.CalculatorViewModel;
+                }
+
+                m_calculator = new Calculator();
+                m_calculator.ViewModel = calcVM;
+                m_calculator.Name = "Calculator";
+                m_calculator.DataContext = calcVM;
                 Binding isStandardBinding = new Binding
                 {
                     Path = new PropertyPath("IsStandard")
@@ -605,7 +601,7 @@ namespace CalculatorApp
                 // Calculator's "default" state is visible, but if we get delay loaded
                 // when in converter, we should not be visible. This is not a problem for converter
                 // since its default state is hidden.
-                ShowHideControls(Model.Mode);
+                ShowHideControls(ViewModel.Mode);
             }
 
             if (m_dateCalculator != null)
@@ -618,13 +614,10 @@ namespace CalculatorApp
         {
             if (m_dateCalculator == null)
             {
-                // delay loading converter
-                m_dateCalculator = new DateCalculator
-                {
-                    Name = "dateCalculator",
-                    DataContext = Model.DateCalcViewModel
-                };
-
+                m_dateCalculator = new DateCalculator();
+                m_dateCalculator.ViewModel = ViewModel.DateCalcViewModel;
+                m_dateCalculator.DataContext = ViewModel.DateCalcViewModel;
+                m_dateCalculator.Name = "dateCalculator";
                 DateCalcHolder.Child = m_dateCalculator;
             }
 
@@ -642,7 +635,7 @@ namespace CalculatorApp
                 m_graphingCalculator = new GraphingCalculator
                 {
                     Name = "GraphingCalculator",
-                    DataContext = Model.GraphingCalcViewModel
+                    DataContext = ViewModel.GraphingCalcViewModel
                 };
 
                 GraphingCalcHolder.Child = m_graphingCalculator;
@@ -657,9 +650,10 @@ namespace CalculatorApp
                 m_converter = new CalculatorApp.UnitConverter
                 {
                     Name = "unitConverter",
-                    DataContext = Model.ConverterViewModel,
                     Style = UnitConverterBaseStyle
                 };
+                m_converter.ViewModel = ViewModel.ConverterViewModel;
+                m_converter.DataContext = ViewModel.ConverterViewModel;
                 ConverterHolder.Child = m_converter;
             }
         }

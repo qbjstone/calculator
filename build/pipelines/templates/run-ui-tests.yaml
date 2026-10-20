@@ -1,7 +1,6 @@
 # This template contains jobs to run UI tests using WinAppDriver.
 
 parameters:
-  isOSSBuild: false
   platform: ''
   runsettingsFileName: ''
 
@@ -11,17 +10,25 @@ jobs:
   dependsOn: Build${{ parameters.platform }}
   condition: succeeded()
   pool:
-    ${{ if eq(parameters.isOSSBuild, true) }}:
-      name: EssentialExperiencesOpenSource-Win11
-    ${{ if eq(parameters.isOSSBuild, false) }}:
-      name: EssentialExperiences-Win11
+    type: windows
+    isCustom: true
+    name: EssentialExperiences-Win11
+    image: Win11Enterprise-BuildTools2022
   variables:
     skipComponentGovernanceDetection: true
     DropName: drop-${{ parameters.platform }}
+    # Test results are just log files, not release binaries — skip SDL scanning
+    ob_outputDirectory: '$(Common.TestResultsDirectory)'
+    ob_artifactBaseName: 'drop-ui-tests-${{ parameters.platform }}-Attempt$(System.JobAttempt)'
+    ob_sdl_binskim_enabled: false
+    ob_sdl_sbom_enabled: false
 
   steps:
-  - checkout: self
-    fetchDepth: 1
+  - task: UseDotNet@2
+    displayName: Install .NET 10 SDK
+    inputs:
+      packageType: 'sdk'
+      version: '10.x'
 
   - task: PowerShell@2
     displayName: Turn off animation effects
@@ -35,24 +42,19 @@ jobs:
       width: 1920
       height: 1080
 
-  - download: current
+  - task: DownloadPipelineArtifact@2
     displayName: Download MsixBundle and CalculatorUITests
-    artifact: $(DropName)
-    patterns: |
-      Calculator/AppPackages/**
-      publish/**
-
-  - task: PowerShell@2
-    displayName: Install certificate
     inputs:
-      filePath: $(Pipeline.Workspace)/$(DropName)/Calculator/AppPackages/Calculator_$(Build.BuildNumber)_Test/Add-AppDevPackage.ps1
-      arguments: -CertificatePath $(Pipeline.Workspace)/$(DropName)/Calculator/AppPackages/Calculator_$(Build.BuildNumber)_Test/Calculator_$(Build.BuildNumber)_${{ parameters.platform }}.cer -Force
+      artifactName: $(DropName)
+      itemPattern: |
+        Calculator/AppPackages/**
+        publish/**
+      targetPath: $(Pipeline.Workspace)\$(DropName)
 
-  - task: PowerShell@2
+  - powershell: |
+      $(Build.SourcesDirectory)/build/scripts/SignTestApp.ps1 -AppToSign '$(Pipeline.Workspace)/$(DropName)/Calculator/AppPackages/Calculator_*_Test/Calculator_*.msixbundle'
+      $(Pipeline.Workspace)/$(DropName)/Calculator/AppPackages/Calculator_*_Test/Add-AppDevPackage.ps1 -Force
     displayName: Install app
-    inputs:
-      filePath: $(Pipeline.Workspace)/$(DropName)/Calculator/AppPackages/Calculator_$(Build.BuildNumber)_Test/Add-AppDevPackage.ps1
-      arguments: -Force
 
   - task: VSTest@2
     displayName: Run CalculatorUITests

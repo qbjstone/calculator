@@ -1665,6 +1665,10 @@
     <value>cup (US)</value>
     <comment>An abbreviation for a measurement unit of volume</comment>
   </data>
+  <data name="UnitAbbreviation_Angstrom" xml:space="preserve">
+    <value>A</value>
+    <comment>An abbreviation for a measurement unit of length</comment>
+  </data>
   <data name="UnitAbbreviation_Acre" xml:space="preserve">
     <value>ac</value>
     <comment>An abbreviation for a measurement unit of volume</comment>
@@ -2239,6 +2243,10 @@
   </data>
   <data name="UnitName_Nanometer" xml:space="preserve">
     <value>Nanometers</value>
+    <comment>A measurement unit for length. (Please choose the most appropriate plural form to fit any number between 0 and 999,999,999,999,999)</comment>
+  </data>
+  <data name="UnitName_Angstrom" xml:space="preserve">
+    <value>Angstroms</value>
     <comment>A measurement unit for length. (Please choose the most appropriate plural form to fit any number between 0 and 999,999,999,999,999)</comment>
   </data>
   <data name="UnitName_NauticalMile" xml:space="preserve">
@@ -3224,11 +3232,11 @@
     <comment>AccessKey for the temperature converter navbar item. {StringCategory="Accelerator"}</comment>
   </data>
   <data name="ClearHistory.AccessKey" xml:space="preserve">
-    <value>C</value>
+    <value>Y</value>
     <comment>Access key for the Clear history button.{StringCategory="Accelerator"}</comment>
   </data>
   <data name="ClearMemory.AccessKey" xml:space="preserve">
-    <value>C</value>
+    <value>R</value>
     <comment>Access key for the Clear memory button. {StringCategory="Accelerator"}</comment>
   </data>
   <data name="ClearMemory.[using:Windows.UI.Xaml.Controls]ToolTipService.ToolTip" xml:space="preserve">
